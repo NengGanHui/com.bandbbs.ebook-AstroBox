@@ -4,7 +4,7 @@
     "version": "2.2.0",
     "description": "在 AstroBox 中同步弦电子书：分章、封面、书籍信息、手环状态与阅读设置",
     "author": "nengganhui & lesetong",
-    "website": "",
+    "website": "https://github.com/NengGanHui/com.bandbbs.ebook-AstroBox",
     "entry": "ebooksync-ng.wasm",
     "wasi_version": 2,
     "api_level": 2,
