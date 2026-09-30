@@ -2264,9 +2264,9 @@ fn handle_file_message(message: &Value) {
 
     match message_type {
         "ready" => plus_on_ready(payload),
-        "next_chunk" => plus_on_next_chunk(),
-        "chapter_chunk_complete" => plus_on_chapter_chunk_complete(),
-        "chapter_saved" => plus_on_chapter_saved(),
+        "next_chunk" => plus_on_next_chunk(payload),
+        "chapter_chunk_complete" => plus_on_chapter_chunk_complete(payload),
+        "chapter_saved" => plus_on_chapter_saved(payload),
         "cover_chunk_received" | "cover_ready" => plus_on_cover_acked(),
         "cover_saved" => {}
         "transfer_finished" => on_success(),
@@ -2680,7 +2680,7 @@ fn plus_on_ready(payload: &Value) {
         t.chunk_idx = 0;
         t.chunk_texts.clear();
         t.retries = 0;
-        !t.cover_done
+        !t.cover_done && !t.cover_chunks.is_empty()
     };
 
     if need_cover {
@@ -2752,7 +2752,7 @@ fn plus_on_cover_acked() {
 
 fn plus_finish_cover() {
     let device_addr = last_device_addr();
-    let message = {
+    let has_cover = {
         let mut s = state();
         let Some(Session {
             job: Job::Plus(t),
@@ -2762,19 +2762,25 @@ fn plus_finish_cover() {
             return;
         };
         t.cover_done = true;
-        protocol::plus_cover_transfer_complete()
+        !t.cover_chunks.is_empty()
     };
 
-    let _ = send_to(&device_addr, &message);
+    if has_cover {
+        let message = protocol::plus_cover_transfer_complete();
+        let _ = send_to(&device_addr, &message);
+        {
+            let mut s = state();
+            log_line(&mut s, "[封面] 发送完成");
+        }
+    }
     {
         let mut s = state();
-        log_line(&mut s, "[封面] 发送完成");
         s.phase_text = Some("发送正文".to_string());
     }
     plus_emit();
 }
 
-fn plus_on_next_chunk() {
+fn plus_on_next_chunk(payload: &Value) {
     {
         let mut s = state();
         let Some(Session {
@@ -2784,13 +2790,45 @@ fn plus_on_next_chunk() {
         else {
             return;
         };
+        if let Some(ack) = payload.get("chunkNum").and_then(|v| v.as_u64()) {
+            if ack != t.chunk_idx as u64 {
+                if ack + 1 != t.chunk_idx as u64 {
+                    tracing::warn!("plus 忽略乱序分块确认 {}（当前 {}）", ack, t.chunk_idx);
+                }
+                return;
+            }
+        }
         t.chunk_idx += 1;
         t.retries = 0;
     }
     plus_emit();
 }
 
-fn plus_on_chapter_chunk_complete() {
+fn plus_on_chapter_chunk_complete(payload: &Value) {
+    {
+        let s = state();
+        let Some(Session {
+            job: Job::Plus(t),
+            ..
+        }) = s.session.as_ref()
+        else {
+            return;
+        };
+        let Some(&idx) = t.send_order.get(t.pos) else {
+            return;
+        };
+        let chapter = t.chapters[idx].index;
+        if let Some(count) = payload.get("count").and_then(|v| v.as_u64()) {
+            if count != chapter as u64 {
+                tracing::warn!("plus 忽略过期章节完成确认 {}（当前 {}）", count, chapter);
+                return;
+            }
+        }
+    }
+    send_current_chapter_complete();
+}
+
+fn send_current_chapter_complete() {
     let device_addr = last_device_addr();
     let message = {
         let s = state();
@@ -2812,7 +2850,7 @@ fn plus_on_chapter_chunk_complete() {
     }
 }
 
-fn plus_on_chapter_saved() {
+fn plus_on_chapter_saved(payload: &Value) {
     let (progress, phase) = {
         let mut s = state();
         let Some(Session {
@@ -2822,6 +2860,16 @@ fn plus_on_chapter_saved() {
         else {
             return;
         };
+        let Some(&idx) = t.send_order.get(t.pos) else {
+            return;
+        };
+        let expected = t.chapters[idx].index;
+        if let Some(saved) = payload.get("chapterIndex").and_then(|v| v.as_u64()) {
+            if saved != expected as u64 {
+                tracing::warn!("plus 忽略过期章节保存回执 {}（当前 {}）", saved, expected);
+                return;
+            }
+        }
         t.pos += 1;
         t.chunk_idx = 0;
         t.chunk_texts.clear();
@@ -2871,53 +2919,57 @@ fn plus_emit() {
             let message = protocol::plus_transfer_complete();
             Some((device_addr.clone(), message, None, 1.0f32, None))
         } else {
-        let chapter_idx = t.send_order[t.pos];
-        if t.chunk_texts.is_empty() {
-            let content = t.chapters[chapter_idx].content.clone();
-            let (len_u16, checksum) = protocol::utf16_len_and_adler32(&content);
-            t.content_len_u16 = len_u16;
-            t.content_checksum = checksum;
-            t.chunk_texts = chapters::split_into_chunks(&content, PLUS_CHUNK_BYTES);
-        }
+            let chapter_idx = t.send_order[t.pos];
+            if t.chunk_texts.is_empty() {
+                let content = t.chapters[chapter_idx].content.clone();
+                let (len_u16, checksum) = protocol::utf16_len_and_adler32(&content);
+                t.content_len_u16 = len_u16;
+                t.content_checksum = checksum;
+                t.chunk_texts = chapters::split_into_chunks(&content, PLUS_CHUNK_BYTES);
+            }
 
-            let total = t.chunk_texts.len().max(1);
-            let idx = t.chunk_idx.min(total.saturating_sub(1));
-            let content = t.chunk_texts[idx].clone();
-            let name = t.chapters[chapter_idx].name.clone();
-            let word_count = t.chapters[chapter_idx].word_count;
+            if t.chunk_idx >= t.chunk_texts.len() {
+                None
+            } else {
+                let total = t.chunk_texts.len();
+                let idx = t.chunk_idx;
+                let content = t.chunk_texts[idx].clone();
+                let name = t.chapters[chapter_idx].name.clone();
+                let word_count = t.chapters[chapter_idx].word_count;
 
-            let message = protocol::plus_chapter_chunk(
-                t.chapters[chapter_idx].index,
-                &name,
-                word_count,
-                &content,
-                idx,
-                total,
-                t.content_len_u16,
-                t.content_checksum,
-            );
-            t.bytes_sent += content.len();
-            let speed = compute_speed_text(&mut t.last_chunk_time, content.len());
-            let progress = (t.pos as f32 + (idx as f32 / total as f32))
-                / t.send_order.len().max(1) as f32;
-            let phase = format!(
-                "第 {}/{} 章 · {} ({} 块)",
-                t.pos + 1,
-                t.send_order.len(),
-                name,
-                total
-            );
+                let message = protocol::plus_chapter_chunk(
+                    t.chapters[chapter_idx].index,
+                    &name,
+                    word_count,
+                    &content,
+                    idx,
+                    total,
+                    t.content_len_u16,
+                    t.content_checksum,
+                );
+                t.bytes_sent += content.len();
+                let speed = compute_speed_text(&mut t.last_chunk_time, content.len());
+                let progress = (t.pos as f32 + (idx as f32 / total as f32))
+                    / t.send_order.len().max(1) as f32;
+                let phase = format!(
+                    "第 {}/{} 章 · {} ({} 块)",
+                    t.pos + 1,
+                    t.send_order.len(),
+                    name,
+                    total
+                );
 
-            tracing::info!(
-                "plus 章节 {}/{} 分块 {}/{} ({} bytes)",
-                t.pos + 1,
-                t.send_order.len(),
-                idx + 1,
-                total,
-                content.len()
-            );
+                tracing::info!(
+                    "plus 章节 {}/{} 分块 {}/{} ({} bytes)",
+                    t.pos + 1,
+                    t.send_order.len(),
+                    idx + 1,
+                    total,
+                    content.len()
+                );
 
-            Some((device_addr.clone(), message, speed, progress, Some(phase)))
+                Some((device_addr.clone(), message, speed, progress, Some(phase)))
+            }
         }
     };
 
@@ -3041,18 +3093,36 @@ fn on_error(payload: &Value) {
     match retry {
         Retry::Plus => {
             tracing::warn!("plus 分块重试：{}", message);
-            let need_cover = {
+            let in_cover = {
                 let s = state();
                 match s.session.as_ref() {
                     Some(Session {
                         job: Job::Plus(t),
                         ..
-                    }) => !t.cover_done,
+                    }) => !t.cover_done && !t.cover_chunks.is_empty(),
                     _ => false,
                 }
             };
-            if need_cover {
+            if in_cover {
                 plus_send_cover_chunk();
+                return;
+            }
+            let chapter_complete_pending = {
+                let s = state();
+                match s.session.as_ref() {
+                    Some(Session {
+                        job: Job::Plus(t),
+                        ..
+                    }) => {
+                        t.pos < t.send_order.len()
+                            && !t.chunk_texts.is_empty()
+                            && t.chunk_idx >= t.chunk_texts.len()
+                    }
+                    _ => false,
+                }
+            };
+            if chapter_complete_pending {
+                send_current_chapter_complete();
             } else {
                 plus_emit();
             }
