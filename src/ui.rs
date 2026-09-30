@@ -24,8 +24,9 @@ const MGMT_QUERY_TIMEOUT_MS: u64 = 8000;
 const MAX_RETRY: usize = 3;
 /// 传输期间链路巡检间隔（1s 轮询，掉线判定见 `STALL_TIMEOUT_SECS`）
 const WATCHDOG_INTERVAL_MS: u64 = 1000;
-/// 超过该时长没有收到任何回包（传输停住不动），即判定掉线
-const STALL_TIMEOUT_SECS: u64 = 3;
+/// 超过该时长没有收到任何回包（传输停住不动），即判定掉线。
+/// 手环端登记章节要写正文/索引文件，且每 30 章触发一次 GC，留足冗余避免误判
+const STALL_TIMEOUT_SECS: u64 = 10;
 /// 连续多少次巡检找不到设备才判定掉线，避免单次查询抖动造成误判
 const OFFLINE_CONFIRM_STRIKES: usize = 2;
 /// 掉线后两次重连之间的等待时间。
@@ -2267,7 +2268,7 @@ fn handle_file_message(message: &Value) {
         "next_chunk" => plus_on_next_chunk(payload),
         "chapter_chunk_complete" => plus_on_chapter_chunk_complete(payload),
         "chapter_saved" => plus_on_chapter_saved(payload),
-        "cover_chunk_received" | "cover_ready" => plus_on_cover_acked(),
+        "cover_chunk_received" | "cover_ready" => plus_on_cover_acked(payload),
         "cover_saved" => {}
         "transfer_finished" => on_success(),
         "error" => on_error(payload),
@@ -2584,8 +2585,21 @@ fn handle_band_message(payload: &Value) -> bool {
                         ..
                     }) = s.session.as_mut()
                     {
-                        job.idx += 1;
-                        job.idx
+                        match payload.get("chunkIndex").and_then(|v| v.as_u64()) {
+                            Some(idx) => {
+                                let next = idx as usize + 1;
+                                if next <= job.idx {
+                                    0
+                                } else {
+                                    job.idx = next.min(job.chunks.len());
+                                    job.idx
+                                }
+                            }
+                            None => {
+                                job.idx += 1;
+                                job.idx
+                            }
+                        }
                     } else {
                         0
                     }
@@ -2672,14 +2686,19 @@ fn plus_on_ready(payload: &Value) {
         else {
             return;
         };
-        t.pos = t
+        if let Some(pos) = t
             .send_order
             .iter()
             .position(|&idx| t.chapters[idx].index == start_from)
-            .unwrap_or(0);
+        {
+            t.pos = pos;
+        } else {
+            tracing::warn!("plus 手环起始章节 {} 不在待发列表，保持当前进度", start_from);
+        }
         t.chunk_idx = 0;
         t.chunk_texts.clear();
         t.retries = 0;
+        t.cover_idx = 0;
         !t.cover_done && !t.cover_chunks.is_empty()
     };
 
@@ -2711,7 +2730,6 @@ fn plus_send_cover_chunk() {
             let idx = t.cover_idx;
             let total = t.cover_chunks.len();
             let message = protocol::plus_cover_chunk(idx, total, &t.cover_chunks[idx]);
-            t.retries = 0;
             Some((device_addr.clone(), message, idx + 1, total))
         }
     };
@@ -2734,7 +2752,7 @@ fn plus_send_cover_chunk() {
     render_from_state();
 }
 
-fn plus_on_cover_acked() {
+fn plus_on_cover_acked(payload: &Value) {
     {
         let mut s = state();
         let Some(Session {
@@ -2744,7 +2762,16 @@ fn plus_on_cover_acked() {
         else {
             return;
         };
-        t.cover_idx += 1;
+        match payload.get("chunkIndex").and_then(|v| v.as_u64()) {
+            Some(idx) => {
+                let next = idx as usize + 1;
+                if next <= t.cover_idx {
+                    return;
+                }
+                t.cover_idx = next;
+            }
+            None => t.cover_idx += 1,
+        }
         t.retries = 0;
     }
     plus_send_cover_chunk();
@@ -2790,15 +2817,25 @@ fn plus_on_next_chunk(payload: &Value) {
         else {
             return;
         };
-        if let Some(ack) = payload.get("chunkNum").and_then(|v| v.as_u64()) {
-            if ack != t.chunk_idx as u64 {
-                if ack + 1 != t.chunk_idx as u64 {
-                    tracing::warn!("plus 忽略乱序分块确认 {}（当前 {}）", ack, t.chunk_idx);
-                }
+        let Some(&idx) = t.send_order.get(t.pos) else {
+            return;
+        };
+        let chapter = t.chapters[idx].index;
+        if let Some(count) = payload.get("count").and_then(|v| v.as_u64()) {
+            if count != chapter as u64 {
+                tracing::warn!("plus 忽略非当前章节的分块确认 {}（当前 {}）", count, chapter);
                 return;
             }
         }
-        t.chunk_idx += 1;
+        match payload.get("chunkNum").and_then(|v| v.as_u64()) {
+            Some(ack) => {
+                if ack + 1 <= t.chunk_idx as u64 {
+                    return;
+                }
+                t.chunk_idx = ack as usize + 1;
+            }
+            None => t.chunk_idx += 1,
+        }
         t.retries = 0;
     }
     plus_emit();
@@ -2806,11 +2843,11 @@ fn plus_on_next_chunk(payload: &Value) {
 
 fn plus_on_chapter_chunk_complete(payload: &Value) {
     {
-        let s = state();
+        let mut s = state();
         let Some(Session {
             job: Job::Plus(t),
             ..
-        }) = s.session.as_ref()
+        }) = s.session.as_mut()
         else {
             return;
         };
@@ -2824,6 +2861,8 @@ fn plus_on_chapter_chunk_complete(payload: &Value) {
                 return;
             }
         }
+        t.chunk_idx = t.chunk_texts.len();
+        t.retries = 0;
     }
     send_current_chapter_complete();
 }
@@ -2851,6 +2890,21 @@ fn send_current_chapter_complete() {
 }
 
 fn plus_on_chapter_saved(payload: &Value) {
+    let all_sent = {
+        let s = state();
+        match s.session.as_ref() {
+            Some(Session {
+                job: Job::Plus(t),
+                ..
+            }) => t.pos >= t.send_order.len(),
+            _ => false,
+        }
+    };
+    if all_sent {
+        plus_emit();
+        return;
+    }
+
     let (progress, phase) = {
         let mut s = state();
         let Some(Session {
@@ -3075,6 +3129,31 @@ fn on_remote_cancel() {
     render_from_state();
 }
 
+fn align_to_band_chapter(t: &mut PlusJob, band_chapter: Option<usize>) {
+    let Some(band_index) = band_chapter else {
+        return;
+    };
+    let current = t.send_order.get(t.pos).map(|&idx| t.chapters[idx].index);
+    if current == Some(band_index) {
+        return;
+    }
+    let Some(pos) = t
+        .send_order
+        .iter()
+        .position(|&idx| t.chapters[idx].index == band_index)
+    else {
+        return;
+    };
+    tracing::warn!(
+        "plus 对齐手环当前章节 {}（本地 {:?}）",
+        band_index,
+        current
+    );
+    t.pos = pos;
+    t.chunk_idx = 0;
+    t.chunk_texts.clear();
+}
+
 fn on_error(payload: &Value) {
     let message = payload
         .get("message")
@@ -3090,17 +3169,41 @@ fn on_error(payload: &Value) {
         session.bump_retry()
     };
 
+    let band_chapter = payload
+        .get("count")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
     match retry {
         Retry::Plus => {
             tracing::warn!("plus 分块重试：{}", message);
             let in_cover = {
-                let s = state();
-                match s.session.as_ref() {
-                    Some(Session {
-                        job: Job::Plus(t),
-                        ..
-                    }) => !t.cover_done && !t.cover_chunks.is_empty(),
-                    _ => false,
+                let mut s = state();
+                let Some(Session {
+                    job: Job::Plus(t),
+                    ..
+                }) = s.session.as_mut()
+                else {
+                    return;
+                };
+                if !t.cover_done && !t.cover_chunks.is_empty() {
+                    if t.retries >= 2 {
+                        t.cover_idx = 0;
+                    }
+                    true
+                } else {
+                    align_to_band_chapter(t, band_chapter);
+                    if t.pos < t.send_order.len() && t.retries >= 2 {
+                        let all_sent =
+                            !t.chunk_texts.is_empty() && t.chunk_idx >= t.chunk_texts.len();
+                        if all_sent || t.chunk_idx > 0 {
+                            let index = t.chapters[t.send_order[t.pos]].index;
+                            tracing::warn!("plus 章节 {} 反复失败，从第 0 块重发", index);
+                            t.chunk_idx = 0;
+                            t.chunk_texts.clear();
+                        }
+                    }
+                    false
                 }
             };
             if in_cover {
