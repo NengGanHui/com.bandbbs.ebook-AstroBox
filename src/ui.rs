@@ -1,7 +1,7 @@
 // 插件 UI 与传输状态
 
 use crate::astrobox::psys_host::{
-    self, device, dialog, interconnect, register, thirdpartyapp, timer, ui,
+    self, device, dialog, interconnect, register, thirdpartyapp, timer, ui_v3 as ui,
 };
 use crate::chapters::{self, Chapter, SplitOptions};
 use crate::protocol;
@@ -4131,7 +4131,7 @@ pub fn render_main_ui(element_id: &str) {
         }
         build_main_ui(&s)
     };
-    psys_host::ui::render(element_id, ui);
+    psys_host::ui_v3::render(element_id, ui);
 }
 
 fn render_from_state() {
@@ -4140,6 +4140,6 @@ fn render_from_state() {
         (s.root_element_id.clone(), build_main_ui(&s))
     };
     if let Some(root_id) = root_id {
-        psys_host::ui::render(&root_id, ui);
+        psys_host::ui_v3::render(&root_id, ui);
     }
 }

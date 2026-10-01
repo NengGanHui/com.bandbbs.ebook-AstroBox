@@ -1,7 +1,4 @@
-use crate::exports::astrobox::psys_plugin::{
-    event::{self, EventType},
-    lifecycle,
-};
+use crate::exports::astrobox::psys_plugin::{event_v3 as event, lifecycle};
 use wit_bindgen::FutureReader;
 
 pub mod chapters;
@@ -10,7 +7,7 @@ pub mod protocol;
 pub mod ui;
 wit_bindgen::generate!({
     path: "wit",
-    world: "psys-world",
+    world: "psys-world-v3",
     generate_all,
 });
 
@@ -18,21 +15,24 @@ struct MyPlugin;
 
 impl event::Guest for MyPlugin {
     #[allow(async_fn_in_trait)]
-    fn on_event(event_type: EventType, event_payload: _rt::String) -> FutureReader<String> {
+    fn on_event(
+        event_type: event::EventType,
+        event_payload: _rt::String,
+    ) -> FutureReader<String> {
         let (writer, reader) = wit_future::new::<String>(|| "".to_string());
 
         match event_type {
-            EventType::InterconnectMessage => {
+            event::EventType::InterconnectMessage => {
                 ui::handle_interconnect_message(&event_payload);
             }
-            EventType::Timer => {
+            event::EventType::Timer => {
                 ui::handle_timer_event(&event_payload);
             }
-            EventType::PluginMessage
-            | EventType::DeviceAction
-            | EventType::ProviderAction
-            | EventType::DeeplinkAction
-            | EventType::TransportPacket => {}
+            event::EventType::PluginMessage
+            | event::EventType::DeviceAction
+            | event::EventType::ProviderAction
+            | event::EventType::DeeplinkAction
+            | event::EventType::TransportPacket => {}
         }
 
         tracing::info!("event_payload: {}", event_payload);
@@ -44,14 +44,14 @@ impl event::Guest for MyPlugin {
         reader
     }
 
-    fn on_ui_event(
+    fn on_ui_event_v3(
         event_id: _rt::String,
-        event: event::Event,
+        event_type: event::Event,
         event_payload: _rt::String,
     ) -> wit_bindgen::rt::async_support::FutureReader<_rt::String> {
         let (writer, reader) = wit_future::new::<String>(|| "".to_string());
 
-        ui::ui_event_processor(event, &event_id, &event_payload);
+        ui::ui_event_processor(event_type, &event_id, &event_payload);
 
         wit_bindgen::spawn(async move {
             let _ = writer.write("".to_string()).await;
